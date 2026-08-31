@@ -1,0 +1,1 @@
+interface Window { showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>; } interface FileSystemDirectoryHandle { values: () => AsyncIterableIterator<any>; }
