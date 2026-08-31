@@ -17,9 +17,12 @@ export function useAudioPlayer() {
   const [isShuffle, setIsShuffle] = useState(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>('off');
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const previousTrackRef = useRef<Track | null>(null);
+  const currentIndexRef = useRef<number | null>(null);
+  const currentAudioUrlRef = useRef<string | null>(null); // URL del blob de audio actualmente cargado
   const analyserRef = useRef<AnalyserNode | null>(null);
   const dataArrayRef = useRef<Uint8Array | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -31,12 +34,10 @@ export function useAudioPlayer() {
     audioRef.current = audio;
     audio.volume = volume;
 
-    // Create AudioContext, GainNode and AnalyserNode
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     const audioContext = new AudioContextClass();
     audioContextRef.current = audioContext;
 
-    // GainNode controla el volumen maestro con fade
     const gainNode = audioContext.createGain();
     gainNode.gain.value = volume;
     gainNodeRef.current = gainNode;
@@ -44,7 +45,6 @@ export function useAudioPlayer() {
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
     const source = audioContext.createMediaElementSource(audio);
-    // Cadena: source → gainNode → analyser → destination
     source.connect(gainNode);
     gainNode.connect(analyser);
     analyser.connect(audioContext.destination);
@@ -53,23 +53,31 @@ export function useAudioPlayer() {
     dataArrayRef.current = new Uint8Array(bufferLength);
 
     const onTimeUpdate = () => setCurrentTime(audio.currentTime);
-    const onDurationChange = () => setDuration(audio.duration || 0);
+    const onDurationChange = () => {
+      const d = audio.duration || 0;
+      setDuration(d);
+      
+      // Sincronizar la duración en la cola si estaba en 0
+      if (d > 0) {
+        setQueue(prev => {
+          const idx = currentIndexRef.current;
+          if (idx !== null && idx >= 0 && idx < prev.length) {
+            const track = prev[idx];
+            if (!track.duration) {
+              const newQueue = [...prev];
+              newQueue[idx] = { ...track, duration: d };
+              return newQueue;
+            }
+          }
+          return prev;
+        });
+      }
+    };
     const onEnded = () => handleEnded();
 
     audio.addEventListener('timeupdate', onTimeUpdate);
     audio.addEventListener('durationchange', onDurationChange);
     audio.addEventListener('ended', onEnded);
-
-    // MediaSession integration
-    if ('mediaSession' in navigator) {
-      navigator.mediaSession.setActionHandler('play', () => togglePlay());
-      navigator.mediaSession.setActionHandler('pause', () => togglePlay());
-      navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
-      navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack());
-      navigator.mediaSession.setActionHandler('seekto', (details) => {
-        if (details.seekTime !== undefined) seekTo(details.seekTime);
-      });
-    }
 
     return () => {
       audio.removeEventListener('timeupdate', onTimeUpdate);
@@ -77,6 +85,11 @@ export function useAudioPlayer() {
       audio.removeEventListener('ended', onEnded);
       audio.pause();
       audio.src = '';
+      // Revocar la última URL de audio cargada para no dejar memoria colgada
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current);
+        currentAudioUrlRef.current = null;
+      }
       if (previousTrackRef.current?.coverUrl) {
         revokeCoverUrl(previousTrackRef.current);
       }
@@ -99,7 +112,7 @@ export function useAudioPlayer() {
     }
   }, [currentIndex, queue]);
 
-  // Cleanup old object URL when track changes
+  // Cleanup old cover object URL when track changes
   useEffect(() => {
     const prev = previousTrackRef.current;
     const current = getCurrentTrack();
@@ -114,45 +127,98 @@ export function useAudioPlayer() {
     return queue[currentIndex];
   }, [currentIndex, queue]);
 
-  const playTrack = useCallback((track: Track) => {
+  /**
+   * Carga una pista en el elemento <audio>, revocando la URL anterior
+   * y aplicando un fade breve para evitar cortes abruptos entre canciones.
+   */
+  const loadAndPlayTrack = useCallback((track: Track, index: number) => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    // Reanudar AudioContext si está suspendido
     if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
 
-    // Find track in queue or add it
+    const switchSource = () => {
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current);
+      }
+      const url = URL.createObjectURL(track.fileBlob);
+      currentAudioUrlRef.current = url;
+      audio.src = url;
+      setCurrentIndex(index);
+      currentIndexRef.current = index;
+      setPlaybackError(null);
+
+      audio.play()
+        .then(() => {
+          if (gainNodeRef.current) {
+            fadeIn(gainNodeRef.current, volume, 200);
+          }
+          setIsPlaying(true);
+        })
+        .catch((err) => {
+          console.error('[useAudioPlayer] Error al reproducir la pista:', err);
+          setIsPlaying(false);
+          setPlaybackError('No se pudo reproducir la pista. Intenta de nuevo.');
+        });
+    };
+
+    // Si ya hay algo sonando, hacemos un fade-out corto antes de cambiar de fuente
+    if (gainNodeRef.current && !audio.paused) {
+      fadeOut(gainNodeRef.current, 150).then(switchSource);
+    } else {
+      switchSource();
+    }
+  }, [volume]);
+
+  const playTrack = useCallback((track: Track) => {
     let index = queue.findIndex(t => t.id === track.id);
     if (index === -1) {
       const newQueue = [...queue, track];
       setQueue(newQueue);
       index = newQueue.length - 1;
     }
-    setCurrentIndex(index);
-    const url = URL.createObjectURL(track.fileBlob);
-    audio.src = url;
-    audio.play();
-    setIsPlaying(true);
-  }, [queue]);
+
+    // Si la pista clickeada ya es la que está cargada, no reiniciar
+    if (currentIndex === index) {
+      const audio = audioRef.current;
+      if (audio && audio.paused) {
+        // Reanuda sin reiniciar (lógica inline para evitar referencia circular)
+        if (audioContextRef.current?.state === 'suspended') {
+          audioContextRef.current.resume();
+        }
+        audio.play().then(() => {
+          if (gainNodeRef.current) fadeIn(gainNodeRef.current, volume, 200);
+          setIsPlaying(true);
+        }).catch(console.error);
+      }
+      return;
+    }
+
+    loadAndPlayTrack(track, index);
+  }, [queue, currentIndex, loadAndPlayTrack, volume]);
 
   const togglePlay = useCallback(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
-    // Reanudar AudioContext si está suspendido
     if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
 
     if (audio.paused) {
-      audio.play().then(() => {
-        if (gainNodeRef.current) {
-          fadeIn(gainNodeRef.current, volume, 200);
-        }
-      });
-      setIsPlaying(true);
+      audio.play()
+        .then(() => {
+          if (gainNodeRef.current) {
+            fadeIn(gainNodeRef.current, volume, 200);
+          }
+          setIsPlaying(true);
+        })
+        .catch((err) => {
+          console.error('[useAudioPlayer] Error al reanudar:', err);
+          setPlaybackError('No se pudo reanudar la reproducción.');
+        });
     } else {
       if (gainNodeRef.current) {
         fadeOut(gainNodeRef.current, 300).then(() => {
@@ -181,18 +247,9 @@ export function useAudioPlayer() {
         else return;
       }
     }
-    setCurrentIndex(nextIndex);
     const track = queue[nextIndex];
-    if (track) {
-      const audio = audioRef.current;
-      if (audio) {
-        const url = URL.createObjectURL(track.fileBlob);
-        audio.src = url;
-        audio.play();
-        setIsPlaying(true);
-      }
-    }
-  }, [queue, currentIndex, isShuffle, repeatMode]);
+    if (track) loadAndPlayTrack(track, nextIndex);
+  }, [queue, currentIndex, isShuffle, repeatMode, loadAndPlayTrack]);
 
   const prevTrack = useCallback(() => {
     if (queue.length === 0) return;
@@ -201,18 +258,9 @@ export function useAudioPlayer() {
       if (repeatMode === 'all') prevIndex = queue.length - 1;
       else return;
     }
-    setCurrentIndex(prevIndex);
     const track = queue[prevIndex];
-    if (track) {
-      const audio = audioRef.current;
-      if (audio) {
-        const url = URL.createObjectURL(track.fileBlob);
-        audio.src = url;
-        audio.play();
-        setIsPlaying(true);
-      }
-    }
-  }, [queue, currentIndex, repeatMode]);
+    if (track) loadAndPlayTrack(track, prevIndex);
+  }, [queue, currentIndex, repeatMode, loadAndPlayTrack]);
 
   const seekTo = useCallback((seconds: number) => {
     const audio = audioRef.current;
@@ -223,14 +271,15 @@ export function useAudioPlayer() {
   }, []);
 
   const setVolumeValue = useCallback((value: number) => {
-    const clamped = Math.min(1, Math.max(0, value));
+    // Permite boost hasta 5× via GainNode; el mínimo es 0.
+    const clamped = Math.min(5, Math.max(0, value));
+    // Para el estado de React usamos el valor real (puede ser > 1 en boost)
     setVolume(clamped);
-    // Controlar volumen via GainNode (no audio.volume) para preservar el fade
     if (gainNodeRef.current) {
       gainNodeRef.current.gain.value = clamped;
     }
     if (clamped === 0) setIsMuted(true);
-    else setIsMuted(false);
+    else if (clamped > 0) setIsMuted(false);
   }, []);
 
   const setSpeed = useCallback((rate: number) => {
@@ -268,7 +317,7 @@ export function useAudioPlayer() {
       const audio = audioRef.current;
       if (audio) {
         audio.currentTime = 0;
-        audio.play();
+        audio.play().catch((err) => console.error('[useAudioPlayer] Error al repetir:', err));
       }
     } else {
       nextTrack();
@@ -283,10 +332,13 @@ export function useAudioPlayer() {
     if (audio) {
       audio.pause();
       audio.src = '';
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current);
+        currentAudioUrlRef.current = null;
+      }
       setCurrentTime(0);
       setDuration(0);
     }
-    // revoke all cover URLs
     queue.forEach(t => {
       if (t.coverUrl) revokeCoverUrl(t);
     });
@@ -298,13 +350,12 @@ export function useAudioPlayer() {
 
   const getFrequencyData = useCallback(() => {
     if (!analyserRef.current || !dataArrayRef.current) return null;
-    // Solucionamos la estrictez de TypeScript forzando el tipado
     analyserRef.current.getByteFrequencyData(dataArrayRef.current as any);
     return dataArrayRef.current;
   }, []);
 
   const updateTrackCover = useCallback((trackId: string, coverUrl: string | undefined) => {
-    setQueue(prevQueue => 
+    setQueue(prevQueue =>
       prevQueue.map(track => {
         if (track.id === trackId) {
           if (track.coverUrl && track.coverUrl !== coverUrl) {
@@ -317,8 +368,41 @@ export function useAudioPlayer() {
     );
   }, []);
 
+  const updateTrackMeta = useCallback((
+    trackId: string,
+    updates: Partial<Pick<Track, 'title' | 'artist' | 'album'>>
+  ) => {
+    setQueue(prevQueue =>
+      prevQueue.map(track =>
+        track.id === trackId ? { ...track, ...updates } : track
+      )
+    );
+  }, []);
+
+
+  // Registro de MediaSession en efecto separado: así los handlers siempre
+  // referencian las versiones más recientes de nextTrack/prevTrack/etc.
+  // (antes quedaban "congelados" con la cola vacía del primer render)
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+    navigator.mediaSession.setActionHandler('play', () => togglePlay());
+    navigator.mediaSession.setActionHandler('pause', () => togglePlay());
+    navigator.mediaSession.setActionHandler('previoustrack', () => prevTrack());
+    navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack());
+    navigator.mediaSession.setActionHandler('seekto', (details) => {
+      if (details.seekTime !== undefined) seekTo(details.seekTime);
+    });
+
+    return () => {
+      navigator.mediaSession.setActionHandler('play', null);
+      navigator.mediaSession.setActionHandler('pause', null);
+      navigator.mediaSession.setActionHandler('previoustrack', null);
+      navigator.mediaSession.setActionHandler('nexttrack', null);
+      navigator.mediaSession.setActionHandler('seekto', null);
+    };
+  }, [togglePlay, prevTrack, nextTrack, seekTo]);
+
   return {
-    // state
     queue,
     currentIndex,
     currentTrack: getCurrentTrack(),
@@ -330,7 +414,7 @@ export function useAudioPlayer() {
     isShuffle,
     repeatMode,
     playbackRate,
-    // actions
+    playbackError,
     playTrack,
     togglePlay,
     nextTrack,
@@ -345,5 +429,6 @@ export function useAudioPlayer() {
     addTracks,
     getFrequencyData,
     updateTrackCover,
+    updateTrackMeta,
   };
 }

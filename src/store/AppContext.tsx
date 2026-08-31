@@ -7,6 +7,19 @@ import {
   loadUser, saveUser, loadPlaylists, savePlaylists, loadSettings, saveSettings,
 } from '../services/storage';
 
+// ─── FAVORITES PERSISTENCE ────────────────────────────────────────────────────
+const FAVORITES_KEY = 'krono_favorites';
+function loadFavorites(): Set<string> {
+  try {
+    const raw = localStorage.getItem(FAVORITES_KEY);
+    if (raw) return new Set(JSON.parse(raw) as string[]);
+  } catch {}
+  return new Set();
+}
+function saveFavorites(ids: Set<string>) {
+  localStorage.setItem(FAVORITES_KEY, JSON.stringify([...ids]));
+}
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
 
 interface AppState {
@@ -16,6 +29,7 @@ interface AppState {
   dominantColor: string;
   isSettingsOpen: boolean;
   isLoading: boolean;
+  favoriteIds: Set<string>;
 }
 
 const DEFAULT_USER: User = { id: 'local-user', displayName: 'Oyente' };
@@ -32,6 +46,7 @@ const initialState: AppState = {
   dominantColor: '#10b981',
   isSettingsOpen: false,
   isLoading: true,
+  favoriteIds: loadFavorites(),
 };
 
 // ─── ACTIONS ──────────────────────────────────────────────────────────────────
@@ -43,6 +58,7 @@ type Action =
   | { type: 'SET_SETTINGS'; payload: Partial<AppSettings> }
   | { type: 'OPEN_SETTINGS' }
   | { type: 'CLOSE_SETTINGS' }
+  | { type: 'TOGGLE_FAVORITE'; payload: string }
   | { type: 'CREATE_PLAYLIST'; payload: { name: string } }
   | { type: 'DELETE_PLAYLIST'; payload: { id: string } }
   | { type: 'RENAME_PLAYLIST'; payload: { id: string; name: string } }
@@ -70,6 +86,14 @@ function reducer(state: AppState, action: Action): AppState {
 
     case 'CLOSE_SETTINGS':
       return { ...state, isSettingsOpen: false };
+
+    case 'TOGGLE_FAVORITE': {
+      const next = new Set(state.favoriteIds);
+      if (next.has(action.payload)) next.delete(action.payload);
+      else next.add(action.payload);
+      saveFavorites(next);
+      return { ...state, favoriteIds: next };
+    }
 
     case 'CREATE_PLAYLIST': {
       const newPlaylist: Playlist = {
@@ -129,6 +153,7 @@ interface AppContextValue {
   updateUser: (updates: Partial<User>) => void;
   setDominantColor: (color: string) => void;
   updateSettings: (updates: Partial<AppSettings>) => void;
+  toggleFavorite: (trackId: string) => void;
   createPlaylist: (name: string) => void;
   deletePlaylist: (id: string) => void;
   renamePlaylist: (id: string, name: string) => void;
@@ -192,6 +217,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: 'SET_SETTINGS', payload: updates });
   }, []);
 
+  const toggleFavorite = useCallback((trackId: string) => {
+    dispatch({ type: 'TOGGLE_FAVORITE', payload: trackId });
+  }, []);
+
   const createPlaylist = useCallback((name: string) => {
     dispatch({ type: 'CREATE_PLAYLIST', payload: { name } });
   }, []);
@@ -218,6 +247,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     updateUser,
     setDominantColor,
     updateSettings,
+    toggleFavorite,
     createPlaylist,
     deletePlaylist,
     renamePlaylist,

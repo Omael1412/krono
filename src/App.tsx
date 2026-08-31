@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { useAudioPlayer } from './hooks/useAudioPlayer';
 import { useTheme } from './hooks/useTheme';
+import { useAppContext } from './store/AppContext';
 import { Sidebar } from './components/layout/Sidebar';
 import { Topbar } from './components/layout/Topbar';
 import { TrackList } from './components/player/TrackList';
@@ -35,9 +36,11 @@ function App() {
     addTracks,
     getFrequencyData,
     updateTrackCover,
+    updateTrackMeta,
   } = useAudioPlayer();
 
   const { dominantColor, settings } = useTheme(currentTrack);
+  const { state: appState, toggleFavorite } = useAppContext();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -89,7 +92,9 @@ function App() {
           <TrackList 
             tracks={queue} 
             currentTrackId={currentTrack?.id}
+            coverShape={settings.coverShape}
             onTrackSelect={playTrack}
+            onUpdateMeta={updateTrackMeta}
           />
         </div>
       </div>
@@ -120,6 +125,8 @@ function App() {
         coverShape={settings.coverShape}
         playerLayout={settings.playerLayout}
         buttonStyle={settings.buttonStyle}
+        favoriteIds={appState.favoriteIds}
+        onToggleFavorite={toggleFavorite}
       />
 
       {/* Modals */}
